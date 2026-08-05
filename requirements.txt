@@ -1,0 +1,5 @@
+aiohttp>=3.9,<4
+requests>=2.31,<3
+pandas>=2.0,<3
+yarl>=1.9,<2
+XlsxWriter>=3.1,<4
