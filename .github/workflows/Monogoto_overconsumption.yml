@@ -1,0 +1,63 @@
+name: Monogoto SIM Usage Audit
+
+# Runs the Monogoto overconsumption report daily, and lets you trigger it
+# on demand from the Actions tab for testing.
+on:
+  schedule:
+    # 10:00 AM EST (UTC-5) = 15:00 UTC, every day.
+    # NOTE: GitHub Actions cron is always UTC and does not observe DST, so
+    # during Eastern Daylight Time (UTC-4, roughly Mar-Nov) this fires at
+    # 11:00 AM Eastern clock time instead of 10:00 AM. If you need it pinned
+    # to 10:00 AM Eastern year-round, swap this single line for two cron
+    # entries (one at "0 15 * * *" for EST months, one at "0 14 * * *" for
+    # EDT months) — say the word and I'll wire that up.
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Monogoto SIM report
+        env:
+          # Forces stdout/stderr to flush per line instead of block-buffering,
+          # so log output streams live in the Actions UI instead of showing
+          # up in one big burst (or not at all) when the process exits.
+          PYTHONUNBUFFERED: "1"
+
+          # Gmail (delivery)
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+
+          # Monogoto (console.monogoto.io login)
+          MONOGOTO_USERNAME: ${{ secrets.MONOGOTO_USERNAME }}
+          MONOGOTO_PASSWORD: ${{ secrets.MONOGOTO_PASSWORD }}
+
+          # Zoho Analytics (Zenduit device / account data)
+          ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
+          ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
+          ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
+          # ZOHO_ORG_ID, ZOHO_ANALYTICS_DOMAIN, ZOHO_ACCOUNTS_DOMAIN, and
+          # ZOHO_ANALYTICS_EXPORT_TIMEOUT_SECONDS are intentionally omitted —
+          # the script has working defaults for all of them. Add any of them
+          # back here (with a matching secret) only if you ever need to
+          # override one.
+
+          # Optional: raise this if a 31-day Monogoto report consistently
+          # needs longer than the script's built-in 900s poll timeout.
+          # MONOGOTO_REPORT_TIMEOUT_SECONDS: ${{ secrets.MONOGOTO_REPORT_TIMEOUT_SECONDS }}
+        run: python main.py
