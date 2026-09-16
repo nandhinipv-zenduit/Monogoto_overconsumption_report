@@ -132,7 +132,7 @@ GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
 
 EMAIL_TO = [
-    "nandhinipv@zenduit.com", "nikithavinod@zenduit.com", "abidali@gofleet.com",
+    "nandhinipv@zenduit.com", "nikithavinod@zenduit.com", "abidali@gofleet.com","amaansardar@zenduit.com","yaseenshafiq@gofleet.com",
       "rizamae@gofleet.com",
 ]
 
