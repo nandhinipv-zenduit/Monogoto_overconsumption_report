@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiohttp import ClientTimeout
 from yarl import URL
-import smtplib
+import base64
 from email.message import EmailMessage
 from io import BytesIO
 
@@ -25,7 +25,7 @@ from io import BytesIO
 # and telenor_sim_report.py (Telenor / Ericsson IoT Accelerator), same
 # overall shape: env-var credentials, a 31-day trailing usage window
 # (T-31 -> T-1) compared against the Zenduit data plan, an in-memory
-# Excel report, and Gmail delivery.
+# Excel report, and Gmail delivery via the Gmail REST API.
 #
 # THE PLATFORM: Monogoto (https://docs.monogoto.io, public docs, no login
 # needed to read them).
@@ -73,50 +73,57 @@ from io import BytesIO
 # ==========================================================
 
 # ==========================================================
-# GMAIL CONFIG (GLOBAL) — OAuth 2.0, not an app password.
+# GMAIL CONFIG (GLOBAL) — OAuth 2.0, via the Gmail REST API, not an app
+# password and not raw SMTP.
 # ==========================================================
 # WHY THIS CHANGED
 #   smtp.gmail.com used to be fed a 16-character "app password". Those get
 #   auto-revoked whenever the account password changes, 2FA is re-enrolled,
-#   or a Workspace admin tightens policy — which shows up here as:
+#   or a Workspace admin tightens policy — which shows up as:
 #       smtplib.SMTPAuthenticationError: (535, b'5.7.8 Username and
 #       Password not accepted ... BadCredentials')
 #   OAuth refresh tokens don't expire on password changes, so the job stops
 #   breaking every time someone rotates a password.
 #
+#   This script previously moved to SMTP + AUTH XOAUTH2, which fixed the
+#   app-password problem but introduced a new one: SMTP's XOAUTH2 mechanism
+#   requires the FULL https://mail.google.com/ scope, and the refresh token
+#   already in use here (same one the 1NCE/FloLive reports use) was only
+#   granted the narrower gmail.send scope — so SMTP kept rejecting it with
+#   535 even though the token itself was minted successfully. Sending via
+#   the Gmail REST API instead avoids that: gmail.send is sufficient for it,
+#   so the existing refresh token/secrets work unchanged.
+#
 # WHAT GOOGLE ACTUALLY NEEDS
-#   A client ID + client secret ALONE cannot authenticate SMTP — they only
+#   A client ID + client secret ALONE cannot authenticate — they only
 #   identify the app, they prove nothing about the mailbox. The mailbox
 #   consent is carried by a REFRESH TOKEN, minted once by the sending
 #   account. At run time the three are exchanged for a short-lived access
-#   token, which is what SMTP's AUTH XOAUTH2 accepts.
+#   token, sent as a Bearer token on the Gmail API call.
 #
 # ENV VARS EXPECTED (set these as GitHub Actions secrets):
 #   GMAIL_USERNAME       the sending mailbox, e.g. reports@zenduit.com
 #   GMAIL_CLIENT_ID      OAuth client ID     (…apps.googleusercontent.com)
 #   GMAIL_CLIENT_SECRET  OAuth client secret (GOCSPX-…)
 #   GMAIL_REFRESH_TOKEN  refresh token minted by GMAIL_USERNAME for the
-#                        https://mail.google.com/ scope
+#                        gmail.send scope (same token already used by the
+#                        1NCE/FloLive reports works fine here)
 #   GMAIL_PASS           no longer used — delete the secret once this runs
 #
 # HOW TO MINT THE REFRESH TOKEN (once, ~3 minutes):
 #   Run get_gmail_refresh_token.py, shipped alongside this file. Or by hand
 #   in Google Cloud Console: create an OAuth client of type "Desktop app",
 #   then in OAuth Playground (⚙ -> "Use your own OAuth credentials") consent
-#   as the sending account to scope https://mail.google.com/ and exchange
-#   the auth code for a refresh token.
+#   as the sending account to scope https://www.googleapis.com/auth/gmail.send
+#   and exchange the auth code for a refresh token.
 #
 # GOTCHAS THAT WILL BITE
-#   - Scope must be https://mail.google.com/ (full). gmail.send is enough
-#     for the Gmail API but NOT for SMTP XOAUTH2.
 #   - While the OAuth consent screen is in "Testing", refresh tokens expire
 #     after 7 days. Publish the app (or keep it Internal on the Workspace)
 #     or this job dies weekly.
 #   - The refresh token belongs to the account that consented; it must be
-#     the same mailbox as GMAIL_USERNAME or Google returns 535 again.
+#     the same mailbox as GMAIL_USERNAME or the API call is rejected.
 # ==========================================================
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
 GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 EMAIL_SENDER = os.getenv("GMAIL_USERNAME")
@@ -761,7 +768,7 @@ def fetch_account_name_lookup(token):
 
 # ==========================================================
 # GMAIL OAUTH2 — mint a short-lived access token from the client
-# id/secret/refresh token, then authenticate SMTP with AUTH XOAUTH2.
+# id/secret/refresh token, then call the Gmail REST API directly.
 # ==========================================================
 def get_gmail_access_token():
     """Exchange the long-lived refresh token for a ~1-hour access token.
@@ -799,24 +806,13 @@ def get_gmail_access_token():
         raise RuntimeError(f"Gmail OAuth failed | status={resp.status_code} | "
                            f"response={data}{hint}")
 
-    scope = data.get("scope", "")
-    if scope and "https://mail.google.com/" not in scope:
-        print(f"⚠️ Granted Gmail scope is '{scope}' — SMTP XOAUTH2 requires the full "
-              f"https://mail.google.com/ scope. gmail.send alone will be rejected with 535.")
     print(f"✅ Gmail access token acquired (expires in {data.get('expires_in', '?')}s)")
     return data["access_token"]
 
 
-def _xoauth2_string(user, access_token):
-    """Google's SASL XOAUTH2 payload: user=<addr>^Aauth=Bearer <tok>^A^A
-    where ^A is 0x01. smtplib base64-encodes what the auth callback returns,
-    so this returns the raw (unencoded) string."""
-    return f"user={user}\x01auth=Bearer {access_token}\x01\x01"
-
-
 # ==========================================================
-# EMAIL — same shape as the 1NCE/Telenor scripts' send_email(), but the
-# login step is OAuth2 rather than an app password.
+# EMAIL — same shape as the 1NCE/FloLive scripts' send_email(): build the
+# MIME message, then POST it to the Gmail API instead of talking SMTP.
 # ==========================================================
 def send_email(overconsumption_count, unmapped_count, excel_buffer):
     msg = EmailMessage()
@@ -842,29 +838,22 @@ Nandhiv
         filename="monogoto_overconsumption_report.xlsx",
     )
 
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
     access_token = get_gmail_access_token()
-    auth_string = _xoauth2_string(EMAIL_SENDER, access_token)
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()          # re-issued after STARTTLS so XOAUTH2 is advertised
-        try:
-            # initial_response_ok=True (the default) means smtplib sends the
-            # payload with the AUTH verb and base64-encodes it for us.
-            server.auth("XOAUTH2", lambda challenge=None: auth_string)
-        except smtplib.SMTPAuthenticationError as e:
-            raise RuntimeError(
-                f"Gmail rejected the OAuth2 token: {e}. The token minted fine, so the "
-                f"client id/secret/refresh token are consistent — the usual causes are "
-                f"(a) the refresh token was consented by a DIFFERENT account than "
-                f"GMAIL_USERNAME={EMAIL_SENDER}, or (b) the scope isn't the full "
-                f"https://mail.google.com/, or (c) a Workspace admin has SMTP/IMAP "
-                f"access disabled for this mailbox."
-            ) from e
-        server.send_message(msg)
-
-    print("📧 Email sent via Gmail OAuth2 (Excel attached from memory)")
+    r = requests.post(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={"raw": raw},
+        timeout=120,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Gmail send failed | status={r.status_code} | response={r.text} — the token "
+            f"minted fine, so the client id/secret/refresh token are consistent; the usual "
+            f"cause is the refresh token was consented by a DIFFERENT account than "
+            f"GMAIL_USERNAME={EMAIL_SENDER}."
+        )
+    print(f"📧 Email sent via Gmail API (message id: {r.json().get('id')})")
 
 
 # ==========================================================
